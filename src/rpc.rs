@@ -1,3 +1,5 @@
+use alloy_primitives::U64;
+use alloy_rpc_types_eth::{Block as AlloyBlock, Header as AlloyHeader};
 use anyhow::{anyhow, Context, Result};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -70,6 +72,48 @@ struct JsonRpcResponse {
 #[derive(Deserialize)]
 struct SubscriptionParams {
     result: Value,
+}
+
+/// What an in-flight request id is waiting for. Matching a reply to its
+/// request goes through this map, so a block-detail reply is tied to the full
+/// block number that was asked for — never to a truncated suffix of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingRequest {
+    BlockByNumber(u64),
+    GasPrice,
+    Subscribe,
+}
+
+/// Hands out unique request ids and remembers what each one is waiting for.
+/// Ids are never reused while the map is live, so two concurrent
+/// `eth_getBlockByNumber` calls — even for block numbers that collide under
+/// `number % 100000` — cannot cross-patch each other's replies.
+struct RequestTracker {
+    next_id: u32,
+    pending: HashMap<u32, PendingRequest>,
+}
+
+impl RequestTracker {
+    /// Ids start high enough to stay clear of the fixed handshake ids
+    /// (`0/1/2`) and the backfill range (`100..`) that run before the
+    /// subscription enters its live loop.
+    fn starting_at(first_id: u32) -> Self {
+        Self {
+            next_id: first_id,
+            pending: HashMap::new(),
+        }
+    }
+
+    fn next(&mut self, kind: PendingRequest) -> u32 {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.pending.insert(id, kind);
+        id
+    }
+
+    fn take(&mut self, id: u32) -> Option<PendingRequest> {
+        self.pending.remove(&id)
+    }
 }
 
 pub struct RpcClient {
@@ -176,11 +220,17 @@ impl RpcClient {
             }
         }
 
+        // A malformed quantity leaves the field at its default rather than
+        // coercing to a measured zero.
         if let Some(hex) = responses.get(&0).and_then(|v| v.as_str()) {
-            data.block_number = parse_hex_u64(hex);
+            if let Some(n) = parse_hex_u64(hex) {
+                data.block_number = n;
+            }
         }
         if let Some(hex) = responses.get(&1).and_then(|v| v.as_str()) {
-            data.gas_price_gwei = parse_hex_u64(hex) as f64 / 1_000_000_000.0;
+            if let Some(n) = parse_hex_u64(hex) {
+                data.gas_price_gwei = n as f64 / 1_000_000_000.0;
+            }
         }
         if let Some(version) = responses.get(&2).and_then(|v| v.as_str()) {
             data.client_version = version.to_string();
@@ -223,7 +273,9 @@ async fn run_subscription_with(
     // Get initial data
     let mut data = RpcData::default();
 
-    // Send initial requests
+    // Send initial requests. Handshake ids stay fixed at 0/1/2; they are
+    // drained by `collect_replies` before the live loop starts and are never
+    // concurrent with the tracked ids handed out below.
     let initial_requests = vec![
         JsonRpcRequest {
             jsonrpc: "2.0",
@@ -257,15 +309,20 @@ async fn run_subscription_with(
     // that is the job.
     let responses = collect_replies(&mut read, initial_requests.len() as u32).await?;
 
-    // Parse initial data
+    // Parse initial data. A quantity the node sent as malformed hex leaves the
+    // field at its default instead of becoming a measured zero.
     if let Some(result) = responses.get(&0) {
         if let Some(hex) = result.as_str() {
-            data.block_number = parse_hex_u64(hex);
+            if let Some(n) = parse_hex_u64(hex) {
+                data.block_number = n;
+            }
         }
     }
     if let Some(result) = responses.get(&1) {
         if let Some(hex) = result.as_str() {
-            data.gas_price_gwei = parse_hex_u64(hex) as f64 / 1_000_000_000.0;
+            if let Some(n) = parse_hex_u64(hex) {
+                data.gas_price_gwei = n as f64 / 1_000_000_000.0;
+            }
         }
     }
     if let Some(result) = responses.get(&2) {
@@ -282,12 +339,18 @@ async fn run_subscription_with(
     // Send initial data
     let _ = tx.send(RpcEvent::Data(data.clone())).await;
 
+    // Ids handed out from here on are unique per request and carry the full
+    // block number they are waiting for, so replies cannot land on the wrong
+    // row even when two block numbers share a `number % 100000` suffix.
+    let mut tracker = RequestTracker::starting_at(1000);
+
     // Subscribe to new block headers
+    let subscribe_id = tracker.next(PendingRequest::Subscribe);
     let subscribe_req = JsonRpcRequest {
         jsonrpc: "2.0",
         method: "eth_subscribe".to_string(),
         params: json!(["newHeads"]),
-        id: 999,
+        id: subscribe_id,
     };
     write
         .send(Message::Text(serde_json::to_string(&subscribe_req)?))
@@ -306,32 +369,13 @@ async fn run_subscription_with(
                     // Check if this is a subscription notification
                     if resp.method.as_deref() == Some("eth_subscription") {
                         if let Some(params) = resp.params {
-                            let block_data = &params.result;
-
-                            // Parse the new block header
-                            let number = block_data["number"]
-                                .as_str()
-                                .map(parse_hex_u64)
-                                .unwrap_or(0);
-
-                            if number > 0 {
-                                let new_block = Block {
-                                    number,
-                                    hash: block_data["hash"].as_str().unwrap_or("0x0").to_string(),
-                                    tx_count: 0, // Headers don't include tx count, will update below
-                                    timestamp: block_data["timestamp"]
-                                        .as_str()
-                                        .map(parse_hex_u64)
-                                        .unwrap_or(0),
-                                    gas_used: block_data["gasUsed"]
-                                        .as_str()
-                                        .map(parse_hex_u64)
-                                        .unwrap_or(0),
-                                    gas_limit: block_data["gasLimit"]
-                                        .as_str()
-                                        .map(parse_hex_u64)
-                                        .unwrap_or(0),
-                                };
+                            // A header that does not deserialize — bad hex in
+                            // `number`, a missing field, a structurally wrong
+                            // shape — is skipped entirely. The subscription
+                            // stays up; no `Block` that looks measured is
+                            // invented from unwrap_or defaults.
+                            if let Some(new_block) = parse_new_head(&params.result) {
+                                let number = new_block.number;
 
                                 // Update data
                                 data.block_number = number;
@@ -342,25 +386,28 @@ async fn run_subscription_with(
                                     data.recent_blocks.pop();
                                 }
 
-                                // Fetch full block to get tx count
-                                // Use block number as request id to match response to correct block
+                                // Fetch full block to get tx count. The id
+                                // carries the full block number so the reply
+                                // patches the right row.
+                                let block_id = tracker.next(PendingRequest::BlockByNumber(number));
                                 let hex_num = format!("0x{:x}", number);
                                 let block_req = JsonRpcRequest {
                                     jsonrpc: "2.0",
                                     method: "eth_getBlockByNumber".to_string(),
                                     params: json!([hex_num, false]),
-                                    id: (number % 100000) as u32 + 10000,
+                                    id: block_id,
                                 };
                                 write
                                     .send(Message::Text(serde_json::to_string(&block_req)?))
                                     .await?;
 
                                 // Also fetch gas price periodically
+                                let gas_id = tracker.next(PendingRequest::GasPrice);
                                 let gas_req = JsonRpcRequest {
                                     jsonrpc: "2.0",
                                     method: "eth_gasPrice".to_string(),
                                     params: json!([]),
-                                    id: 1001,
+                                    id: gas_id,
                                 };
                                 write
                                     .send(Message::Text(serde_json::to_string(&gas_req)?))
@@ -370,29 +417,24 @@ async fn run_subscription_with(
                                 let _ = tx.send(RpcEvent::Data(data.clone())).await;
                             }
                         }
-                    } else if let (Some(id), Some(result)) = (resp.id, resp.result) {
-                        // Handle response to our requests
-                        if id >= 10000 && id < 110000 {
-                            // Block details response - update tx count for matching block
-                            let block_num_suffix = (id - 10000) as u64;
-                            let tx_count = result["transactions"]
-                                .as_array()
-                                .map(|arr| arr.len())
-                                .unwrap_or(0);
-                            // Find the block with matching number suffix
-                            if let Some(block) = data
-                                .recent_blocks
-                                .iter_mut()
-                                .find(|b| b.number % 100000 == block_num_suffix)
-                            {
-                                block.tx_count = tx_count;
+                    } else if let Some(id) = resp.id {
+                        match tracker.take(id) {
+                            Some(PendingRequest::BlockByNumber(number)) => {
+                                if apply_block_detail(&mut data, number, resp.result.as_ref()) {
+                                    let _ = tx.send(RpcEvent::Data(data.clone())).await;
+                                }
                             }
-                            let _ = tx.send(RpcEvent::Data(data.clone())).await;
-                        } else if id == 1001 {
-                            // Gas price response
-                            if let Some(hex) = result.as_str() {
-                                data.gas_price_gwei = parse_hex_u64(hex) as f64 / 1_000_000_000.0;
+                            Some(PendingRequest::GasPrice) => {
+                                if let Some(hex) = resp.result.as_ref().and_then(|v| v.as_str()) {
+                                    if let Some(n) = parse_hex_u64(hex) {
+                                        data.gas_price_gwei = n as f64 / 1_000_000_000.0;
+                                        let _ = tx.send(RpcEvent::Data(data.clone())).await;
+                                    }
+                                }
                             }
+                            // Subscribe ack, handshake ids, or anything we are
+                            // no longer waiting on: nothing to patch.
+                            Some(PendingRequest::Subscribe) | None => {}
                         }
                     }
                 }
@@ -405,6 +447,53 @@ async fn run_subscription_with(
     }
 
     Ok(true)
+}
+
+/// Turns a `newHeads` notification payload into a [`Block`], or `None` if the
+/// header does not deserialize. Callers skip the block on `None` and keep the
+/// subscription running — a bad header is never allowed to become a row that
+/// looks measured.
+fn parse_new_head(value: &Value) -> Option<Block> {
+    let header: AlloyHeader = serde_json::from_value(value.clone()).ok()?;
+    let number = header.number;
+    if number == 0 {
+        return None;
+    }
+    Some(Block {
+        number,
+        hash: header.hash.to_string(),
+        tx_count: 0, // Headers don't include tx count, will update below
+        timestamp: header.timestamp,
+        gas_used: header.gas_used,
+        gas_limit: header.gas_limit,
+    })
+}
+
+/// Applies an `eth_getBlockByNumber` reply to the recent block with the full
+/// number the request was made for. Returns whether `data` changed.
+///
+/// A null result, a body that fails to deserialize, or a block that has already
+/// fallen out of the 30-row window all leave `tx_count` untouched rather than
+/// writing a guessed zero over an unknown.
+fn apply_block_detail(data: &mut RpcData, number: u64, result: Option<&Value>) -> bool {
+    let Some(result) = result else {
+        // Null result: the node has no such block. Nothing to patch.
+        return false;
+    };
+    let Ok(block) = serde_json::from_value::<AlloyBlock>(result.clone()) else {
+        // Structurally unexpected body: leave the row alone.
+        return false;
+    };
+    if block.header.number != number {
+        // Reply is not the block we asked for; refuse to cross-patch.
+        return false;
+    }
+    let tx_count = block.transactions.len();
+    let Some(row) = data.recent_blocks.iter_mut().find(|b| b.number == number) else {
+        return false;
+    };
+    row.tx_count = tx_count;
+    true
 }
 
 /// Collects one reply for each request id below `expected` and returns the
@@ -470,35 +559,41 @@ where
     // Send all block requests. Only a request that actually went out gets a
     // reply, so the expected count follows the sends: waiting on a request
     // that failed to send is waiting on a reply that was never asked for.
-    let mut expected = 0;
+    // Each sent id is recorded against the full block number it asked for, so
+    // the reply is matched by identity rather than by reconstructing the
+    // number from an id arithmetic scheme.
+    let mut sent: Vec<(u32, u64)> = Vec::with_capacity(count as usize);
     for i in 0..count {
         let block_num = start_block.saturating_sub(i as u64);
         let hex_num = format!("0x{:x}", block_num);
+        let id = 100 + i;
         let req = JsonRpcRequest {
             jsonrpc: "2.0",
             method: "eth_getBlockByNumber".to_string(),
             params: json!([hex_num, false]),
-            id: 100 + i,
+            id,
         };
         if write
             .send(Message::Text(serde_json::to_string(&req)?))
             .await
             .is_ok()
         {
-            expected += 1;
+            sent.push((id, block_num));
         }
     }
 
     // Collect responses. One request going unanswered used to hang the whole
     // subscription here, so this waits on the same bounded read as everything
     // else and gives up to the reconnect path if the node stops replying.
+    let expected = sent.len();
+    let expected_ids: std::collections::HashSet<u32> = sent.iter().map(|(id, _)| *id).collect();
     let mut block_responses: HashMap<u32, Value> = HashMap::new();
     let mut received = 0;
     while received < expected {
         if let Message::Text(text) = read_message(read, HANDSHAKE_TIMEOUT).await? {
             if let Ok(resp) = serde_json::from_str::<JsonRpcResponse>(&text) {
                 if let Some(id) = resp.id {
-                    if (100..100 + count).contains(&id) {
+                    if expected_ids.contains(&id) {
                         // A null result is still an answer: the node has no
                         // such block (pruned history, or a chain shorter than
                         // the window). The block is skipped, not waited for
@@ -514,31 +609,44 @@ where
         }
     }
 
-    // Parse blocks in order
-    let mut blocks = Vec::with_capacity(count as usize);
-    for i in 0..count {
-        if let Some(result) = block_responses.get(&(100 + i)) {
-            let block_num = start_block.saturating_sub(i as u64);
-            blocks.push(Block {
-                number: block_num,
-                hash: result["hash"].as_str().unwrap_or("0x0").to_string(),
-                tx_count: result["transactions"]
-                    .as_array()
-                    .map(|arr| arr.len())
-                    .unwrap_or(0),
-                timestamp: result["timestamp"].as_str().map(parse_hex_u64).unwrap_or(0),
-                gas_used: result["gasUsed"].as_str().map(parse_hex_u64).unwrap_or(0),
-                gas_limit: result["gasLimit"].as_str().map(parse_hex_u64).unwrap_or(0),
-            });
+    // Parse blocks in request order. A body that fails to deserialize is
+    // skipped the same way a null result is: no Block built from unwrap_or
+    // defaults, just an absent row.
+    let mut blocks = Vec::with_capacity(expected);
+    for (id, block_num) in &sent {
+        if let Some(result) = block_responses.get(id) {
+            if let Ok(block) = serde_json::from_value::<AlloyBlock>(result.clone()) {
+                blocks.push(Block {
+                    number: *block_num,
+                    hash: block.header.hash.to_string(),
+                    tx_count: block.transactions.len(),
+                    timestamp: block.header.timestamp,
+                    gas_used: block.header.gas_used,
+                    gas_limit: block.header.gas_limit,
+                });
+            }
         }
     }
 
     Ok(blocks)
 }
 
-fn parse_hex_u64(hex: &str) -> u64 {
-    let hex = hex.trim_start_matches("0x");
-    u64::from_str_radix(hex, 16).unwrap_or(0)
+/// Parses a JSON-RPC hex quantity with alloy's `U64`. Malformed hex returns
+/// `None` instead of coercing to `0`, so a bad reply stays distinguishable
+/// from a real zero-height block or a zero gas price.
+///
+/// An empty string (or a bare `0x` with no digits) is rejected up front:
+/// `U64`'s `FromStr` treats an empty digit sequence as zero, which would turn
+/// a missing quantity into a measured zero.
+fn parse_hex_u64(hex: &str) -> Option<u64> {
+    let digits = hex
+        .strip_prefix("0x")
+        .or_else(|| hex.strip_prefix("0X"))
+        .unwrap_or(hex);
+    if digits.is_empty() {
+        return None;
+    }
+    hex.parse::<U64>().ok().map(|u| u.to())
 }
 
 #[cfg(test)]
@@ -609,21 +717,47 @@ mod tests {
     /// code under test tries to read past the end, `read_message` reports the
     /// connection closed and the test fails, which is exactly the regression
     /// being guarded against: waiting for replies that are never coming.
+    #[allow(clippy::result_large_err)] // stream item type is fixed by the trait bound
     fn replies(
         texts: Vec<String>,
     ) -> impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin {
-        futures::stream::iter(
-            texts
-                .into_iter()
-                .map(|t| Ok::<_, tokio_tungstenite::tungstenite::Error>(Message::Text(t))),
-        )
+        futures::stream::iter(texts.into_iter().map(|t| Ok(Message::Text(t))))
+    }
+
+    /// A structurally valid `eth_getBlockByNumber` result: full header fields
+    /// alloy's `Block` requires, plus `transactions` as 32-byte hashes so
+    /// `tx_count` is a real length rather than a guessed zero.
+    fn block_result_json(number: u64, tx_count: usize) -> Value {
+        let txs: Vec<String> = (1..=tx_count).map(|i| format!("0x{i:064x}")).collect();
+        json!({
+            "hash": format!("0x{:064x}", number.wrapping_add(1)),
+            "parentHash": format!("0x{:064x}", number),
+            "sha3Uncles": "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347",
+            "miner": "0x0000000000000000000000000000000000000000",
+            "stateRoot": format!("0x{:064x}", number.wrapping_add(2)),
+            "transactionsRoot": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+            "receiptsRoot": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+            "logsBloom": format!("0x{}", "0".repeat(512)),
+            "difficulty": "0x0",
+            "number": format!("0x{:x}", number),
+            "gasLimit": "0x1c9c380",
+            "gasUsed": "0x5208",
+            "timestamp": "0x642aa48f",
+            "extraData": "0x",
+            "mixHash": format!("0x{:064x}", number.wrapping_add(3)),
+            "nonce": "0x0000000000000000",
+            "transactions": txs,
+            "uncles": []
+        })
     }
 
     fn block_reply(id: u32) -> String {
-        format!(
-            r#"{{"id":{},"result":{{"hash":"0xabc","transactions":["0x1","0x2"],"timestamp":"0x0","gasUsed":"0x5","gasLimit":"0x64"}}}}"#,
-            id
-        )
+        // The `Block.number` the caller keeps comes from the request mapping;
+        // the number inside the body only has to deserialize. Two txs match
+        // the assertions in the interleaved-noise test.
+        let number = id as u64;
+        let result = block_result_json(number, 2);
+        json!({ "id": id, "result": result }).to_string()
     }
 
     fn null_reply(id: u32) -> String {
@@ -645,7 +779,7 @@ mod tests {
         let responses = collect_replies(&mut read, 3).await.unwrap();
 
         assert_eq!(responses.get(&0).and_then(|v| v.as_str()), Some("0x64"));
-        assert!(responses.get(&1).is_none());
+        assert!(!responses.contains_key(&1));
         assert_eq!(
             responses.get(&2).and_then(|v| v.as_str()),
             Some("MockNode/0.1")
@@ -667,7 +801,7 @@ mod tests {
         let responses = collect_replies(&mut read, 3).await.unwrap();
 
         assert_eq!(responses.len(), 2);
-        assert!(responses.get(&999).is_none());
+        assert!(!responses.contains_key(&999));
     }
 
     #[tokio::test]
@@ -740,6 +874,113 @@ mod tests {
         let numbers: Vec<u64> = blocks.iter().map(|b| b.number).collect();
         assert_eq!(numbers, vec![199]);
         assert_eq!(blocks[0].tx_count, 2);
+    }
+
+    #[test]
+    fn malformed_hex_is_not_read_as_zero() {
+        assert_eq!(parse_hex_u64("0xzz"), None);
+        assert_eq!(parse_hex_u64(""), None);
+        assert_eq!(parse_hex_u64("0x"), None);
+        // A real zero still parses; only malformed input becomes unknown.
+        assert_eq!(parse_hex_u64("0x0"), Some(0));
+        assert_eq!(parse_hex_u64("0x64"), Some(100));
+        assert_eq!(parse_hex_u64("0x3b9aca00"), Some(1_000_000_000));
+    }
+
+    #[test]
+    fn a_malformed_new_head_is_skipped_not_zeroed() {
+        let mut header = block_result_json(42, 0);
+        header["number"] = json!("0xzz");
+        assert!(parse_new_head(&header).is_none());
+
+        let mut missing = block_result_json(42, 0);
+        missing.as_object_mut().unwrap().remove("number");
+        assert!(parse_new_head(&missing).is_none());
+
+        // A structurally valid header still becomes a Block.
+        let good = parse_new_head(&block_result_json(42, 0)).expect("valid header");
+        assert_eq!(good.number, 42);
+        assert_eq!(good.gas_used, 0x5208);
+        assert_eq!(good.gas_limit, 0x1c9c380);
+    }
+
+    #[test]
+    fn colliding_suffixes_patch_the_right_rows() {
+        // 100_005 and 5 share `number % 100000 == 5`. The old scheme gave
+        // both the same request id and matched by suffix, so whichever reply
+        // arrived second could overwrite the first row. Matching on the full
+        // number carried by the id keeps them apart — including when the
+        // replies arrive out of order.
+        let mut data = RpcData {
+            recent_blocks: vec![
+                Block {
+                    number: 100_005,
+                    hash: "0xaa".into(),
+                    tx_count: 0,
+                    timestamp: 1,
+                    gas_used: 1,
+                    gas_limit: 1,
+                },
+                Block {
+                    number: 5,
+                    hash: "0xbb".into(),
+                    tx_count: 0,
+                    timestamp: 2,
+                    gas_used: 2,
+                    gas_limit: 2,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut tracker = RequestTracker::starting_at(1000);
+        let id_a = tracker.next(PendingRequest::BlockByNumber(100_005));
+        let id_b = tracker.next(PendingRequest::BlockByNumber(5));
+        assert_ne!(id_a, id_b, "colliding suffixes must still get unique ids");
+
+        // Out of order: the colliding suffix's smaller block answers first.
+        let result_b = block_result_json(5, 3);
+        let result_a = block_result_json(100_005, 7);
+
+        let pending_b = tracker.take(id_b);
+        let pending_a = tracker.take(id_a);
+        assert_eq!(pending_b, Some(PendingRequest::BlockByNumber(5)));
+        assert_eq!(pending_a, Some(PendingRequest::BlockByNumber(100_005)));
+
+        // Drive `apply_block_detail` through the same number each id carried.
+        if let Some(PendingRequest::BlockByNumber(n)) = pending_b {
+            assert!(apply_block_detail(&mut data, n, Some(&result_b)));
+        }
+        if let Some(PendingRequest::BlockByNumber(n)) = pending_a {
+            assert!(apply_block_detail(&mut data, n, Some(&result_a)));
+        }
+
+        assert_eq!(data.recent_blocks[0].number, 100_005);
+        assert_eq!(data.recent_blocks[0].tx_count, 7);
+        assert_eq!(data.recent_blocks[1].number, 5);
+        assert_eq!(data.recent_blocks[1].tx_count, 3);
+    }
+
+    #[test]
+    fn a_malformed_block_detail_leaves_the_row_alone() {
+        let mut data = RpcData {
+            recent_blocks: vec![Block {
+                number: 7,
+                hash: "0xcc".into(),
+                tx_count: 0,
+                timestamp: 1,
+                gas_used: 1,
+                gas_limit: 1,
+            }],
+            ..Default::default()
+        };
+        let bad = json!({ "number": "0xzz", "transactions": "not-an-array" });
+        assert!(!apply_block_detail(&mut data, 7, Some(&bad)));
+        assert_eq!(data.recent_blocks[0].tx_count, 0);
+
+        // A reply for a different block number must not cross-patch either.
+        let other = block_result_json(8, 5);
+        assert!(!apply_block_detail(&mut data, 7, Some(&other)));
+        assert_eq!(data.recent_blocks[0].tx_count, 0);
     }
 
     use std::sync::atomic::{AtomicBool, Ordering};
