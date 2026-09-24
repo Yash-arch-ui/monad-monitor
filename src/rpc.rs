@@ -26,6 +26,15 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const RECONNECT_MIN: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
+/// Outstanding tracked requests tolerated before the subscription gives up and
+/// reconnects. Each `newHeads` notification adds a block-detail and a
+/// gas-price request; a node that keeps streaming heads but never answers them
+/// would otherwise grow the map by two per head forever, and its
+/// notifications keep resetting `READ_TIMEOUT` so the socket never looks
+/// dead. 64 is many seconds of unanswered detail traffic on a healthy chain
+/// and still a hard ceiling on a lying one.
+const MAX_PENDING_REQUESTS: usize = 64;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Block {
     pub number: u64,
@@ -38,8 +47,13 @@ pub struct Block {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RpcData {
-    pub block_number: u64,
-    pub gas_price_gwei: f64,
+    /// `None` while the quantity has never been read (or the opening reply
+    /// was malformed). `Some(0)` is a real zero-height reading, which is
+    /// different from "no reading yet".
+    pub block_number: Option<u64>,
+    /// `None` while the quantity has never been read. `Some(0.0)` is a real
+    /// zero gas price, which is different from "no reading yet".
+    pub gas_price_gwei: Option<f64>,
     pub recent_blocks: Vec<Block>,
     pub client_version: String,
 }
@@ -113,6 +127,17 @@ impl RequestTracker {
 
     fn take(&mut self, id: u32) -> Option<PendingRequest> {
         self.pending.remove(&id)
+    }
+
+    fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Whether `more` further requests fit under the outstanding bound. The
+    /// caller checks both detail and gas-price slots before sending either,
+    /// so a silent node cannot leave a half-issued pair behind.
+    fn will_fit(&self, more: usize) -> bool {
+        self.pending_len() + more <= MAX_PENDING_REQUESTS
     }
 }
 
@@ -220,17 +245,14 @@ impl RpcClient {
             }
         }
 
-        // A malformed quantity leaves the field at its default rather than
-        // coercing to a measured zero.
-        if let Some(hex) = responses.get(&0).and_then(|v| v.as_str()) {
-            if let Some(n) = parse_hex_u64(hex) {
-                data.block_number = n;
-            }
+        // A malformed quantity leaves the field unknown (`None`) rather than
+        // coercing to a measured zero, so consumers can tell "not read" from
+        // a real zero-height block or a zero gas price.
+        if let Some(n) = responses.get(&0).and_then(|v| v.as_str()).and_then(parse_hex_u64) {
+            data.block_number = Some(n);
         }
-        if let Some(hex) = responses.get(&1).and_then(|v| v.as_str()) {
-            if let Some(n) = parse_hex_u64(hex) {
-                data.gas_price_gwei = n as f64 / 1_000_000_000.0;
-            }
+        if let Some(n) = responses.get(&1).and_then(|v| v.as_str()).and_then(parse_hex_u64) {
+            data.gas_price_gwei = Some(n as f64 / 1_000_000_000.0);
         }
         if let Some(version) = responses.get(&2).and_then(|v| v.as_str()) {
             data.client_version = version.to_string();
@@ -310,20 +332,21 @@ async fn run_subscription_with(
     let responses = collect_replies(&mut read, initial_requests.len() as u32).await?;
 
     // Parse initial data. A quantity the node sent as malformed hex leaves the
-    // field at its default instead of becoming a measured zero.
-    if let Some(result) = responses.get(&0) {
-        if let Some(hex) = result.as_str() {
-            if let Some(n) = parse_hex_u64(hex) {
-                data.block_number = n;
-            }
-        }
+    // field unknown instead of becoming a measured zero; a previously measured
+    // value cannot exist yet because `data` starts at the default.
+    if let Some(n) = responses
+        .get(&0)
+        .and_then(|v| v.as_str())
+        .and_then(parse_hex_u64)
+    {
+        data.block_number = Some(n);
     }
-    if let Some(result) = responses.get(&1) {
-        if let Some(hex) = result.as_str() {
-            if let Some(n) = parse_hex_u64(hex) {
-                data.gas_price_gwei = n as f64 / 1_000_000_000.0;
-            }
-        }
+    if let Some(n) = responses
+        .get(&1)
+        .and_then(|v| v.as_str())
+        .and_then(parse_hex_u64)
+    {
+        data.gas_price_gwei = Some(n as f64 / 1_000_000_000.0);
     }
     if let Some(result) = responses.get(&2) {
         if let Some(version) = result.as_str() {
@@ -331,9 +354,11 @@ async fn run_subscription_with(
         }
     }
 
-    // Fetch initial blocks
-    if data.block_number > 0 {
-        data.recent_blocks = fetch_blocks(&mut write, &mut read, data.block_number, 30).await?;
+    // Fetch initial blocks. A height of zero is a reading, but there is
+    // nothing behind it to backfill; only a height above genesis is worth
+    // asking for history.
+    if let Some(start) = data.block_number.filter(|&n| n > 0) {
+        data.recent_blocks = fetch_blocks(&mut write, &mut read, start, 30).await?;
     }
 
     // Send initial data
@@ -378,12 +403,26 @@ async fn run_subscription_with(
                                 let number = new_block.number;
 
                                 // Update data
-                                data.block_number = number;
+                                data.block_number = Some(number);
 
                                 // Add new block to front, keep max 30
                                 data.recent_blocks.insert(0, new_block);
                                 if data.recent_blocks.len() > 30 {
                                     data.recent_blocks.pop();
+                                }
+
+                                // Bound outstanding requests before issuing
+                                // either half of this head's pair. A node that
+                                // keeps streaming heads but never answers the
+                                // detail/gas requests would grow the map by
+                                // two per head while its notifications reset
+                                // the read timeout; exceeding the bound ends
+                                // the subscription so the caller reconnects.
+                                if !tracker.will_fit(2) {
+                                    return Err(anyhow!(
+                                        "node left {} RPC requests unanswered; reconnecting",
+                                        tracker.pending_len()
+                                    ));
                                 }
 
                                 // Fetch full block to get tx count. The id
@@ -425,11 +464,8 @@ async fn run_subscription_with(
                                 }
                             }
                             Some(PendingRequest::GasPrice) => {
-                                if let Some(hex) = resp.result.as_ref().and_then(|v| v.as_str()) {
-                                    if let Some(n) = parse_hex_u64(hex) {
-                                        data.gas_price_gwei = n as f64 / 1_000_000_000.0;
-                                        let _ = tx.send(RpcEvent::Data(data.clone())).await;
-                                    }
+                                if apply_gas_price(&mut data, resp.result.as_ref()) {
+                                    let _ = tx.send(RpcEvent::Data(data.clone())).await;
                                 }
                             }
                             // Subscribe ack, handshake ids, or anything we are
@@ -472,28 +508,63 @@ fn parse_new_head(value: &Value) -> Option<Block> {
 /// Applies an `eth_getBlockByNumber` reply to the recent block with the full
 /// number the request was made for. Returns whether `data` changed.
 ///
-/// A null result, a body that fails to deserialize, or a block that has already
-/// fallen out of the 30-row window all leave `tx_count` untouched rather than
-/// writing a guessed zero over an unknown.
+/// A null result, a body that fails [`decode_block_body`], or a block that has
+/// already fallen out of the 30-row window all leave `tx_count` untouched
+/// rather than writing a guessed zero over an unknown.
 fn apply_block_detail(data: &mut RpcData, number: u64, result: Option<&Value>) -> bool {
     let Some(result) = result else {
         // Null result: the node has no such block. Nothing to patch.
         return false;
     };
-    let Ok(block) = serde_json::from_value::<AlloyBlock>(result.clone()) else {
-        // Structurally unexpected body: leave the row alone.
+    let Some(block) = decode_block_body(result, number) else {
+        // Not a trustworthy answer to this request: leave the row alone.
         return false;
     };
-    if block.header.number != number {
-        // Reply is not the block we asked for; refuse to cross-patch.
-        return false;
-    }
     let tx_count = block.transactions.len();
     let Some(row) = data.recent_blocks.iter_mut().find(|b| b.number == number) else {
         return false;
     };
     row.tx_count = tx_count;
     true
+}
+
+/// Applies an `eth_gasPrice` reply. Returns whether `data` changed.
+///
+/// A null result or a malformed quantity leaves the previous reading — or
+/// still-unknown `None` — in place, so a bad live reply cannot turn a
+/// measured price into a measured zero (or erase one that never existed).
+pub(crate) fn apply_gas_price(data: &mut RpcData, result: Option<&Value>) -> bool {
+    let Some(hex) = result.and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let Some(n) = parse_hex_u64(hex) else {
+        return false;
+    };
+    data.gas_price_gwei = Some(n as f64 / 1_000_000_000.0);
+    true
+}
+
+/// Decodes an `eth_getBlockByNumber` body as the answer to the request for
+/// `requested`, or `None` when the body is not that answer.
+///
+/// Two shapes are refused even though they deserialize:
+///
+/// - A body with no `transactions` list. Alloy maps a missing field to
+///   `BlockTransactions::Uncle`, whose length is zero, so a node that omits
+///   the list would overwrite a real count with a guessed zero. An explicit
+///   empty array is a real zero-height answer and stays valid.
+/// - A header whose `number` differs from `requested`. Accepting it and then
+///   substituting the requested number would stamp one block's hash and
+///   fields onto another's row.
+fn decode_block_body(result: &Value, requested: u64) -> Option<AlloyBlock> {
+    if !matches!(result.get("transactions"), Some(Value::Array(_))) {
+        return None;
+    }
+    let block: AlloyBlock = serde_json::from_value(result.clone()).ok()?;
+    if block.header.number != requested {
+        return None;
+    }
+    Some(block)
 }
 
 /// Collects one reply for each request id below `expected` and returns the
@@ -609,13 +680,14 @@ where
         }
     }
 
-    // Parse blocks in request order. A body that fails to deserialize is
-    // skipped the same way a null result is: no Block built from unwrap_or
-    // defaults, just an absent row.
+    // Parse blocks in request order. A body that fails to deserialize, has no
+    // transaction list, or belongs to a different block is skipped the same
+    // way a null result is: no Block built from unwrap_or defaults, just an
+    // absent row.
     let mut blocks = Vec::with_capacity(expected);
     for (id, block_num) in &sent {
         if let Some(result) = block_responses.get(id) {
-            if let Ok(block) = serde_json::from_value::<AlloyBlock>(result.clone()) {
+            if let Some(block) = decode_block_body(result, *block_num) {
                 blocks.push(Block {
                     number: *block_num,
                     hash: block.header.hash.to_string(),
@@ -751,11 +823,10 @@ mod tests {
         })
     }
 
-    fn block_reply(id: u32) -> String {
-        // The `Block.number` the caller keeps comes from the request mapping;
-        // the number inside the body only has to deserialize. Two txs match
-        // the assertions in the interleaved-noise test.
-        let number = id as u64;
+    fn block_reply(id: u32, number: u64) -> String {
+        // The body carries the block number that was requested; the id only
+        // routes the reply. Two txs match the assertions in the
+        // interleaved-noise test.
         let result = block_result_json(number, 2);
         json!({ "id": id, "result": result }).to_string()
     }
@@ -823,7 +894,11 @@ mod tests {
         // Blocks 200 and 198 exist; 199 is pruned and answers null. The stream
         // holds exactly three replies, so completing at all proves nothing
         // waited on a fourth.
-        let mut read = replies(vec![block_reply(100), null_reply(101), block_reply(102)]);
+        let mut read = replies(vec![
+            block_reply(100, 200),
+            null_reply(101),
+            block_reply(102, 198),
+        ]);
 
         let blocks = fetch_blocks(&mut write, &mut read, 200, 3).await.unwrap();
 
@@ -848,7 +923,7 @@ mod tests {
         // Only the first request goes out, so only one reply exists. Expecting
         // three would leave the loop reading a stream with nothing left.
         let mut write = MockSink::accepting(1);
-        let mut read = replies(vec![block_reply(100)]);
+        let mut read = replies(vec![block_reply(100, 200)]);
 
         let blocks = fetch_blocks(&mut write, &mut read, 200, 3).await.unwrap();
 
@@ -864,7 +939,7 @@ mod tests {
         let mut write = MockSink::accepting_all();
         let mut read = replies(vec![
             r#"{"method":"eth_subscription","params":{"result":{}}}"#.to_string(),
-            block_reply(101),
+            block_reply(101, 199),
             r#"{"id":999,"result":"0xdeadbeef"}"#.to_string(),
             null_reply(100),
         ]);
@@ -874,6 +949,56 @@ mod tests {
         let numbers: Vec<u64> = blocks.iter().map(|b| b.number).collect();
         assert_eq!(numbers, vec![199]);
         assert_eq!(blocks[0].tx_count, 2);
+    }
+
+    #[tokio::test]
+    async fn a_backfill_body_for_another_block_is_refused() {
+        // Requested block 200; the node answers id 100 with a valid block-7
+        // fixture. Substituting the requested number would stamp block 7's
+        // hash and fields onto a row claiming to be 200.
+        let mut write = MockSink::accepting_all();
+        let mut read = replies(vec![block_reply(100, 7)]);
+
+        let blocks = fetch_blocks(&mut write, &mut read, 200, 1).await.unwrap();
+
+        assert!(
+            blocks.is_empty(),
+            "a body for a different block must not become the requested row: {blocks:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backfill_body_without_a_transaction_list_is_skipped() {
+        // Alloy deserializes a missing `transactions` field as
+        // `BlockTransactions::Uncle` (length zero). Accepting that would
+        // publish a guessed zero tx count for a body that never carried one.
+        let mut body = block_result_json(200, 2);
+        body.as_object_mut().unwrap().remove("transactions");
+
+        let mut write = MockSink::accepting_all();
+        let mut read = replies(vec![json!({ "id": 100, "result": body }).to_string()]);
+
+        let blocks = fetch_blocks(&mut write, &mut read, 200, 1).await.unwrap();
+
+        assert!(blocks.is_empty(), "listless body must be skipped: {blocks:?}");
+    }
+
+    #[tokio::test]
+    async fn an_explicit_empty_transaction_list_is_a_real_zero() {
+        // The other side of the refusal above: `[]` is a measured zero, not a
+        // missing list, and has to survive as a row with `tx_count == 0`.
+        let mut write = MockSink::accepting_all();
+        let mut read = replies(vec![json!({
+            "id": 100,
+            "result": block_result_json(200, 0),
+        })
+        .to_string()]);
+
+        let blocks = fetch_blocks(&mut write, &mut read, 200, 1).await.unwrap();
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].number, 200);
+        assert_eq!(blocks[0].tx_count, 0);
     }
 
     #[test]
@@ -981,6 +1106,163 @@ mod tests {
         let other = block_result_json(8, 5);
         assert!(!apply_block_detail(&mut data, 7, Some(&other)));
         assert_eq!(data.recent_blocks[0].tx_count, 0);
+    }
+
+    #[test]
+    fn a_body_without_a_transaction_list_does_not_zero_a_nonzero_row() {
+        // Alloy maps a missing `transactions` field to
+        // `BlockTransactions::Uncle` (length 0). Against a row that already
+        // carries a real count, accepting that would overwrite 9 with 0 —
+        // the overwrite is only visible if the row starts nonzero.
+        let mut data = RpcData {
+            recent_blocks: vec![Block {
+                number: 7,
+                hash: "0xcc".into(),
+                tx_count: 9,
+                timestamp: 1,
+                gas_used: 1,
+                gas_limit: 1,
+            }],
+            ..Default::default()
+        };
+
+        let mut listless = block_result_json(7, 3);
+        listless.as_object_mut().unwrap().remove("transactions");
+        assert!(!apply_block_detail(&mut data, 7, Some(&listless)));
+        assert_eq!(
+            data.recent_blocks[0].tx_count, 9,
+            "a body with no transaction list must not zero the row"
+        );
+
+        // Null and non-array forms are the same refusal.
+        let null_txs = json!({ "number": "0x7", "transactions": null });
+        assert!(!apply_block_detail(&mut data, 7, Some(&null_txs)));
+        assert_eq!(data.recent_blocks[0].tx_count, 9);
+
+        // An explicit empty array is a real zero and still applies.
+        let empty = block_result_json(7, 0);
+        assert!(apply_block_detail(&mut data, 7, Some(&empty)));
+        assert_eq!(data.recent_blocks[0].tx_count, 0);
+    }
+
+    #[test]
+    fn a_bad_gas_reply_keeps_the_previous_reading_not_zero() {
+        let mut data = RpcData {
+            gas_price_gwei: Some(2.0),
+            ..Default::default()
+        };
+
+        assert!(!apply_gas_price(&mut data, Some(&json!("0xzz"))));
+        assert_eq!(data.gas_price_gwei, Some(2.0), "malformed reply overwrote");
+
+        assert!(!apply_gas_price(&mut data, None));
+        assert_eq!(data.gas_price_gwei, Some(2.0), "absent reply erased");
+
+        // A real zero still lands as zero — it is a measurement.
+        assert!(apply_gas_price(&mut data, Some(&json!("0x0"))));
+        assert_eq!(data.gas_price_gwei, Some(0.0));
+    }
+
+    /// Answers the handshake and the subscribe request, then streams `heads`
+    /// `newHeads` notifications without ever answering the detail or
+    /// gas-price requests those heads provoke. Block height `0x0` keeps the
+    /// backfill out of the picture.
+    fn heads_without_replies_server(
+        heads: u32,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("read local addr");
+        let thread = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut ws = tokio_tungstenite::tungstenite::accept(stream).expect("upgrade");
+            let mut answered = 0;
+            while answered < 3 {
+                if let Ok(Message::Text(text)) = ws.read() {
+                    let req: Value = serde_json::from_str(&text).expect("json request");
+                    let id = req["id"].as_u64().expect("request id");
+                    let result = match id {
+                        0 => "0x0",
+                        1 => "0x3b9aca00",
+                        _ => "MockNode/0.1",
+                    };
+                    let _ = ws.send(Message::Text(
+                        json!({"id": id, "result": result}).to_string(),
+                    ));
+                    answered += 1;
+                }
+            }
+            let _ = ws.read(); // subscribe request
+            for n in 1..=heads {
+                let header = block_result_json(n as u64, 0);
+                let note = json!({
+                    "jsonrpc": "2.0",
+                    "method": "eth_subscription",
+                    "params": { "result": header },
+                });
+                if ws.send(Message::Text(note.to_string())).is_err() {
+                    break; // client is gone — it hit the bound and left
+                }
+            }
+            // Hold the socket open briefly so the client fails on the bound
+            // rather than on a closed stream.
+            std::thread::sleep(Duration::from_millis(200));
+            let _ = ws.close(None);
+        });
+        (addr, thread)
+    }
+
+    #[tokio::test]
+    async fn continued_heads_with_missing_replies_end_the_subscription() {
+        // More heads than the outstanding-request bound allows: every head
+        // adds a detail and a gas-price request that never comes back, and
+        // the notifications keep resetting the read timeout. The
+        // subscription must give up (so the caller reconnects) instead of
+        // growing the map forever.
+        let heads = (MAX_PENDING_REQUESTS as u32) + 8;
+        let (addr, thread) = heads_without_replies_server(heads);
+        let (tx, mut rx) = mpsc::channel(8);
+        // Drain as the TUI would: a full channel would park the subscription
+        // on `send` before it ever reaches the outstanding-request bound.
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_subscription_with(&format!("ws://{addr}"), &tx, Duration::from_secs(2)),
+        )
+        .await
+        .expect("the bound must end the subscription, not hang");
+        drop(tx);
+        let _ = drain.await;
+        let _ = thread.join();
+
+        let err = outcome.expect_err("unanswered requests are not a healthy stream");
+        let text = format!("{:#}", err);
+        assert!(
+            text.contains("unanswered"),
+            "should name the unanswered requests: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unanswered_requests_that_stay_under_the_bound_do_not_end_the_stream() {
+        // The other side of the bound: a short gap with no replies is not
+        // itself fatal, so a healthy (if momentarily slow) node is not
+        // torn down by the same check.
+        assert!(RequestTracker::starting_at(1000).will_fit(2));
+
+        let mut tracker = RequestTracker::starting_at(1000);
+        for i in 0..MAX_PENDING_REQUESTS {
+            let id = tracker.next(PendingRequest::BlockByNumber(i as u64));
+            assert!(id >= 1000);
+        }
+        assert_eq!(tracker.pending_len(), MAX_PENDING_REQUESTS);
+        assert!(
+            !tracker.will_fit(2),
+            "the bound must refuse further pairs once full"
+        );
+        // Taking a reply frees room again — the normal path.
+        tracker.take(1000);
+        assert!(tracker.will_fit(1));
     }
 
     use std::sync::atomic::{AtomicBool, Ordering};
