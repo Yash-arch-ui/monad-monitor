@@ -188,6 +188,55 @@ mod tests {
     }
 
     #[test]
+    fn an_unread_height_serializes_as_null_rather_than_zero() {
+        // Neither source has read a height: a fresh state whose RPC reply
+        // never parsed a block quantity. A script must see null here, not a
+        // node sitting at genesis.
+        let mut state = AppState::new();
+        state.update_rpc(RpcData::default());
+
+        let v = serde_json::to_value(Snapshot::from_state(&state, "mainnet", true)).unwrap();
+        assert!(
+            v["block_height"].is_null(),
+            "an unread height reached the snapshot as {}",
+            v["block_height"]
+        );
+        assert!(
+            v["block_difference"].is_null(),
+            "a difference was computed against a height nobody read"
+        );
+    }
+
+    #[test]
+    fn a_real_zero_height_reaches_the_snapshot_as_zero() {
+        // The other side of the same contract: a node at genesis reports
+        // zero, and that is a reading. Both branches keep it -- the
+        // subscription leading, and the metrics poll after it drops.
+        let mut state = AppState::new();
+        state.update_rpc(RpcData {
+            block_number: Some(0),
+            ..Default::default()
+        });
+        state.update_metrics(PrometheusMetrics {
+            block_num: None,
+            ..Default::default()
+        });
+
+        let v = serde_json::to_value(Snapshot::from_state(&state, "mainnet", true)).unwrap();
+        assert_eq!(
+            v["block_height"], 0,
+            "a measured zero-height reading was reported as no reading"
+        );
+
+        state.set_ws_disconnected("gone".to_string());
+        let v = serde_json::to_value(Snapshot::from_state(&state, "mainnet", true)).unwrap();
+        assert_eq!(
+            v["block_height"], 0,
+            "the disconnected branch lost the measured zero"
+        );
+    }
+
+    #[test]
     fn flattened_metrics_and_system_fields_are_present() {
         let mut state = AppState::new();
         let metrics = PrometheusMetrics {

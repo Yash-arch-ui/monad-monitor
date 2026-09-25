@@ -248,10 +248,18 @@ impl RpcClient {
         // A malformed quantity leaves the field unknown (`None`) rather than
         // coercing to a measured zero, so consumers can tell "not read" from
         // a real zero-height block or a zero gas price.
-        if let Some(n) = responses.get(&0).and_then(|v| v.as_str()).and_then(parse_hex_u64) {
+        if let Some(n) = responses
+            .get(&0)
+            .and_then(|v| v.as_str())
+            .and_then(parse_hex_u64)
+        {
             data.block_number = Some(n);
         }
-        if let Some(n) = responses.get(&1).and_then(|v| v.as_str()).and_then(parse_hex_u64) {
+        if let Some(n) = responses
+            .get(&1)
+            .and_then(|v| v.as_str())
+            .and_then(parse_hex_u64)
+        {
             data.gas_price_gwei = Some(n as f64 / 1_000_000_000.0);
         }
         if let Some(version) = responses.get(&2).and_then(|v| v.as_str()) {
@@ -980,7 +988,10 @@ mod tests {
 
         let blocks = fetch_blocks(&mut write, &mut read, 200, 1).await.unwrap();
 
-        assert!(blocks.is_empty(), "listless body must be skipped: {blocks:?}");
+        assert!(
+            blocks.is_empty(),
+            "listless body must be skipped: {blocks:?}"
+        );
     }
 
     #[tokio::test]
