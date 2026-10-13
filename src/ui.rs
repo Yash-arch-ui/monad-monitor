@@ -258,7 +258,7 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState, title_color: Col
                 .bold(),
         )),
         Line::from(vec![
-            Span::styled("✓ ", Style::default().fg(sync_color)),
+            Span::styled(sync_symbol(sync_status), Style::default().fg(sync_color)),
             Span::styled(sync_status, Style::default().fg(sync_color)),
             Span::styled(format!(" ({})", diff_str), Style::default().fg(label_color)),
         ]),
@@ -297,7 +297,7 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState, title_color: Col
             Span::styled(format!(" {}", peer_trend_arrow), Style::default().fg(peer_trend_color)),
         ]),
         Line::from(vec![
-            Span::styled("↑ ", Style::default().fg(peer_color)),
+            Span::styled(peer_symbol(peer_health), Style::default().fg(peer_color)),
             Span::styled(peer_health, Style::default().fg(peer_color)),
         ]),
     ];
@@ -818,6 +818,27 @@ fn format_age(secs: u64) -> String {
     }
 }
 
+/// Symbol drawn before the sync status, chosen from the reading the same way
+/// the SVC field picks its mark. Only a synced node gets a completion mark.
+fn sync_symbol(sync_status: &str) -> &'static str {
+    match sync_status {
+        "synced" => "✓ ",
+        _ => "⟳ ",
+    }
+}
+
+/// Symbol drawn before the peer health. Only `healthy` points up; an unread
+/// field gets a question mark rather than a direction nobody measured.
+fn peer_symbol(peer_health: &str) -> &'static str {
+    match peer_health {
+        "healthy" => "↑ ",
+        "ok" => "→ ",
+        "low" => "↓ ",
+        "no peers" => "✗ ",
+        _ => "? ",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -981,5 +1002,87 @@ mod tests {
         state.network = "a".repeat(63);
 
         terminal.draw(|f| draw(f, &state)).unwrap();
+    }
+
+    fn screen_rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn render_rows(state: &AppState) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(240, 40)).unwrap();
+        terminal.draw(|f| draw(f, state)).unwrap();
+        screen_rows(&terminal)
+    }
+
+    #[test]
+    fn sync_symbol_marks_completion_only_when_synced() {
+        assert_eq!(sync_symbol("synced"), "✓ ");
+        assert_eq!(sync_symbol("syncing"), "⟳ ");
+    }
+
+    #[test]
+    fn peer_symbol_points_up_only_for_healthy() {
+        assert_eq!(peer_symbol("healthy"), "↑ ");
+        assert_eq!(peer_symbol("ok"), "→ ");
+        assert_eq!(peer_symbol("low"), "↓ ");
+        assert_eq!(peer_symbol("no peers"), "✗ ");
+        assert_eq!(peer_symbol("..."), "? ");
+    }
+
+    #[test]
+    fn header_draws_the_sync_symbol_the_reading_selects() {
+        // statesync target 0 is the issue's synced control row.
+        for (progress, target, expected, absent) in [
+            (None, None, "✓ synced", "⟳ synced"),
+            (Some(0), Some(0), "✓ synced", "⟳ synced"),
+            (Some(10), Some(100), "⟳ syncing", "✓ syncing"),
+            (Some(10), None, "⟳ syncing", "✓ syncing"),
+        ] {
+            let mut state = AppState::new();
+            state.metrics.statesync_progress = progress;
+            state.metrics.statesync_target = target;
+            let rows = render_rows(&state);
+            assert!(
+                rows.iter().any(|r| r.contains(expected)),
+                "{progress:?}/{target:?}: missing {expected:?}"
+            );
+            assert!(
+                !rows.iter().any(|r| r.contains(absent)),
+                "{progress:?}/{target:?}: drew {absent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn header_draws_the_peer_symbol_the_reading_selects() {
+        // 60 peers is the healthy control row.
+        for (peers, expected) in [
+            (Some(60), "↑ healthy"),
+            (Some(12), "→ ok"),
+            (Some(5), "↓ low"),
+            (Some(0), "✗ no peers"),
+            (None, "? ..."),
+        ] {
+            let mut state = AppState::new();
+            state.metrics.peer_count = peers;
+            let rows = render_rows(&state);
+            assert!(
+                rows.iter().any(|r| r.contains(expected)),
+                "{peers:?}: missing {expected:?}"
+            );
+            if peers != Some(60) {
+                assert!(
+                    !rows.iter().any(|r| r.contains("↑ ")),
+                    "{peers:?}: drew an up arrow"
+                );
+            }
+        }
     }
 }
