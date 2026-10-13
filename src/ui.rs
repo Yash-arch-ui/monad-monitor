@@ -820,10 +820,13 @@ fn format_age(secs: u64) -> String {
 
 /// Symbol drawn before the sync status, chosen from the reading the same way
 /// the SVC field picks its mark. Only a synced node gets a completion mark.
+/// `◌` (U+25CC) is one cell wide everywhere, East Asian ambiguous width
+/// included, and sits in the same block as the `●` pulse, so fonts that draw
+/// the header already carry it; `⟳` is missing from most monospace fonts.
 fn sync_symbol(sync_status: &str) -> &'static str {
     match sync_status {
         "synced" => "✓ ",
-        _ => "⟳ ",
+        _ => "◌ ",
     }
 }
 
@@ -1024,7 +1027,7 @@ mod tests {
     #[test]
     fn sync_symbol_marks_completion_only_when_synced() {
         assert_eq!(sync_symbol("synced"), "✓ ");
-        assert_eq!(sync_symbol("syncing"), "⟳ ");
+        assert_eq!(sync_symbol("syncing"), "◌ ");
     }
 
     #[test]
@@ -1040,10 +1043,10 @@ mod tests {
     fn header_draws_the_sync_symbol_the_reading_selects() {
         // statesync target 0 is the issue's synced control row.
         for (progress, target, expected, absent) in [
-            (None, None, "✓ synced", "⟳ synced"),
-            (Some(0), Some(0), "✓ synced", "⟳ synced"),
-            (Some(10), Some(100), "⟳ syncing", "✓ syncing"),
-            (Some(10), None, "⟳ syncing", "✓ syncing"),
+            (None, None, "✓ synced", "◌ synced"),
+            (Some(0), Some(0), "✓ synced", "◌ synced"),
+            (Some(10), Some(100), "◌ syncing", "✓ syncing"),
+            (Some(10), None, "◌ syncing", "✓ syncing"),
         ] {
             let mut state = AppState::new();
             state.metrics.statesync_progress = progress;
