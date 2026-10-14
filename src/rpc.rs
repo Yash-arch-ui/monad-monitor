@@ -1539,4 +1539,47 @@ mod tests {
         assert_eq!(wait, RECONNECT_MIN);
         assert_eq!(next, RECONNECT_MIN * 2);
     }
+
+    #[tokio::test]
+    async fn a_frozen_node_answering_each_reconnect_keeps_the_no_block_clock_running() {
+        // Two real sessions against a node that answers the handshake with the
+        // same height and never sends a head, fed into the state the way
+        // `main` does. The second handshake is the reconnect after a read
+        // timeout; it must not look like a block.
+        let mut state = crate::state::AppState::new();
+        for session in 0..2 {
+            if session == 1 {
+                tokio::time::sleep(Duration::from_millis(1_100)).await;
+            }
+            let (addr, thread) = healthy_server(Duration::from_millis(50));
+            let (tx, mut rx) = mpsc::channel(64);
+            let mut streamed = false;
+            let _ = tokio::time::timeout(
+                Duration::from_secs(5),
+                run_subscription_with(
+                    &format!("ws://{addr}"),
+                    &tx,
+                    Duration::from_millis(500),
+                    &mut streamed,
+                ),
+            )
+            .await;
+            thread.join().expect("server thread");
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    RpcEvent::Data(data) => state.update_rpc(data),
+                    RpcEvent::Connected => state.set_ws_connected(),
+                    RpcEvent::Disconnected(reason) => state.set_ws_disconnected(reason),
+                }
+            }
+        }
+
+        // At least the second slept between the sessions; master reads 0 here.
+        // Not an exact value, so a slow runner cannot turn the test red.
+        let secs = state.alert_sample().secs_since_block;
+        assert!(
+            secs.is_some_and(|s| s >= 1),
+            "the reconnect's handshake restarted the no-block clock: {secs:?}"
+        );
+    }
 }

@@ -61,6 +61,10 @@ pub struct AppState {
     // poll also refreshes: a dead WebSocket has to stay visible even while
     // Prometheus keeps answering.
     last_rpc_block_at: Option<Instant>,
+    // The height `last_rpc_block_at` was last moved by. Every reconnect handshake
+    // replays the node's current `eth_blockNumber`, so a node that froze but still
+    // answers RPC would otherwise restart the clock about every half minute.
+    last_rpc_block_number: u64,
     pub ws_connected: bool,
 
     // Why the subscription is down, kept separate from `last_error` because a
@@ -121,6 +125,7 @@ impl AppState {
             last_rpc_height: 0,
             polls_since_sample: 0,
             last_rpc_block_at: None,
+            last_rpc_block_number: 0,
             ws_connected: false,
             ws_error: None,
             webhook_error: None,
@@ -255,8 +260,20 @@ impl AppState {
             );
         }
 
-        if rpc_data.block_number.is_some() {
-            self.last_rpc_block_at = Some(Instant::now());
+        // The no-block clock moves on the first reading and on a height above the
+        // last one, never on a repeat: the handshake after a reconnect sends the
+        // height the node already had, and a frozen node keeps sending it.
+        if let Some(height) = rpc_data.block_number {
+            if self.last_rpc_block_at.is_none() {
+                self.last_rpc_block_at = Some(Instant::now());
+                self.last_rpc_block_number = height;
+            } else {
+                Self::note_height(
+                    &mut self.last_rpc_block_number,
+                    &mut self.last_rpc_block_at,
+                    height,
+                );
+            }
         }
         self.ws_connected = true;
         self.rpc_data = rpc_data;
@@ -1489,5 +1506,76 @@ mod tests {
     fn default_network_is_mainnet() {
         let state = AppState::new();
         assert_eq!(state.network, "mainnet");
+    }
+
+    /// Moves the no-block clock back as if `secs` had passed since it was last
+    /// set, so the tests below need no sleeps.
+    fn age_no_block_clock(state: &mut AppState, secs: u64) {
+        state.last_rpc_block_at = Some(Instant::now() - std::time::Duration::from_secs(secs));
+    }
+
+    #[test]
+    fn a_reconnect_at_the_same_height_does_not_restart_the_no_block_clock() {
+        // A frozen node whose RPC still answers: every reconnect handshake
+        // replays the height it already had. That is not a block arriving.
+        let mut state = AppState::new();
+        state.update_rpc(rpc_at(1_000));
+        age_no_block_clock(&mut state, 40);
+
+        state.set_ws_disconnected("read timed out".to_string());
+        state.update_rpc(RpcData {
+            block_number: Some(1_000),
+            ..Default::default()
+        });
+        state.set_ws_connected();
+
+        let secs = state.alert_sample().secs_since_block;
+        assert!(
+            secs.is_some_and(|s| s >= 40),
+            "a replayed height must not restart the clock: {secs:?}"
+        );
+    }
+
+    #[test]
+    fn a_higher_height_restarts_the_no_block_clock() {
+        let mut state = AppState::new();
+        state.update_rpc(rpc_at(1_000));
+        age_no_block_clock(&mut state, 40);
+
+        state.update_rpc(rpc_at(1_001));
+
+        assert_eq!(state.alert_sample().secs_since_block, Some(0));
+    }
+
+    #[test]
+    fn a_node_that_starts_over_lower_restarts_the_clock_on_its_next_block() {
+        // Same rule as `note_height` (#60): a lower height is the node starting
+        // over, not a block, and the next height above it is one.
+        let mut state = AppState::new();
+        state.update_rpc(rpc_at(1_000));
+        age_no_block_clock(&mut state, 40);
+
+        state.update_rpc(rpc_at(10));
+        let secs = state.alert_sample().secs_since_block;
+        assert!(
+            secs.is_some_and(|s| s >= 40),
+            "a lower height is not a block: {secs:?}"
+        );
+
+        state.update_rpc(rpc_at(11));
+        assert_eq!(state.alert_sample().secs_since_block, Some(0));
+    }
+
+    #[test]
+    fn the_first_reading_starts_the_no_block_clock_even_at_height_zero() {
+        let mut state = AppState::new();
+        assert_eq!(state.alert_sample().secs_since_block, None);
+
+        state.update_rpc(RpcData {
+            block_number: Some(0),
+            ..Default::default()
+        });
+
+        assert_eq!(state.alert_sample().secs_since_block, Some(0));
     }
 }
